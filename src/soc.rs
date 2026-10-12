@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use rp2350_emu::{Config, Emulator, EmulatorBuilder};
 
 use crate::keyboard::KeyboardMatrix;
+use crate::profiler::Profiler;
 use crate::spi_sd::{SectorStorage, SpiSdCard};
 use crate::symbols::FirmwareSymbols;
 use crate::uf2::FlashImage;
@@ -34,6 +35,7 @@ pub struct CoCoZeroSoC {
     pub keyboard_ready_forced: bool,
     pub keyboard: KeyboardMatrix,
     pub symbols: FirmwareSymbols,
+    pub profiler: Option<Profiler>,
 }
 
 impl CoCoZeroSoC {
@@ -76,6 +78,7 @@ impl CoCoZeroSoC {
             keyboard_ready_forced: false,
             keyboard: KeyboardMatrix::new(),
             symbols,
+            profiler: None,
         })
     }
 
@@ -161,9 +164,25 @@ impl CoCoZeroSoC {
             self.emu.bus.uart[0].push_rx_byte(ch);
         }
 
-        self.emu
-            .run(cycles)
-            .map_err(|e| format!("Emulator run error: {:?}", e))?;
+        match self.profiler.as_mut() {
+            None => {
+                self.emu
+                    .run(cycles)
+                    .map_err(|e| format!("Emulator run error: {:?}", e))?;
+            }
+            Some(prof) => {
+                // Run in profiler-sized slices, sampling PCs between them.
+                let mut left = cycles;
+                while left > 0 {
+                    let n = left.min(prof.interval);
+                    self.emu
+                        .run(n)
+                        .map_err(|e| format!("Emulator run error: {:?}", e))?;
+                    prof.sample(&self.emu);
+                    left -= n;
+                }
+            }
+        }
 
         self.total_cycles += cycles;
         self.update_sd_cs();

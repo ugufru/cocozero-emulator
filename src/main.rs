@@ -6,6 +6,9 @@ use clap::Parser;
 use cocozero_rp2350::fat32::build_virtual_fat32;
 use cocozero_rp2350::frontend::Frontend;
 
+use cocozero_rp2350::profiler::{
+    ElfSymbols, M6809Locator, Profiler, DEFAULT_CPU_PTR_OFFSET, DEFAULT_REG_PC_OFFSET,
+};
 use cocozero_rp2350::soc::{CoCoZeroSoC, FB_PIXELS};
 use cocozero_rp2350::spi_sd::{FileStorage, MemoryStorage, SectorStorage};
 use cocozero_rp2350::uf2::{parse_uf2, FlashImage};
@@ -52,6 +55,18 @@ struct Args {
     /// Override framebuffer SRAM address (e.g. 0x20010000)
     #[arg(long)]
     fb_addr: Option<String>,
+
+    /// Write a PC profile (ARM cores and 6809 guest) to this file on exit
+    #[arg(long)]
+    profile: Option<PathBuf>,
+
+    /// Emulated cycles between profile samples
+    #[arg(long, default_value_t = 10_000)]
+    profile_interval: u64,
+
+    /// Override 6809 PC location as CPU_PTR_OFFSET,REG_PC_OFFSET (default 340,88)
+    #[arg(long)]
+    profile_6809_offsets: Option<String>,
 }
 
 fn main() {
@@ -138,6 +153,10 @@ fn main() {
             println!("Explicit CLI override: forcing framebuffer address to 0x{:08X}", addr);
             soc.fb_addr = Some(addr);
         }
+    }
+
+    if args.profile.is_some() {
+        soc.profiler = Some(build_profiler(&args));
     }
 
     // 5. Initialize Frontend
@@ -258,4 +277,58 @@ fn main() {
         total_elapsed,
         frame_count as f64 / total_elapsed.max(0.001)
     );
+
+    if let (Some(prof), Some(path)) = (&soc.profiler, &args.profile) {
+        match prof.write_report(path) {
+            Ok(()) => println!("PC profile written to {}", path.display()),
+            Err(e) => eprintln!("Failed to write PC profile {}: {}", path.display(), e),
+        }
+    }
+}
+
+fn build_profiler(args: &Args) -> Profiler {
+    // Same ELF the symbol auto-detect uses: --elf, else roms/cocozero.elf.
+    let default_elf = PathBuf::from("roms/cocozero.elf");
+    let elf = args.elf.clone().or_else(|| default_elf.is_file().then_some(default_elf));
+    let symbols = elf.as_ref().and_then(|p| match ElfSymbols::load(p) {
+        Ok(s) => {
+            println!("Profiler: {} function symbols from {}", s.funcs.len(), p.display());
+            Some(s)
+        }
+        Err(e) => {
+            eprintln!("Profiler: cannot read ELF: {}", e);
+            None
+        }
+    });
+
+    let (cpu_ptr_offset, reg_pc_offset) = match &args.profile_6809_offsets {
+        None => (DEFAULT_CPU_PTR_OFFSET, DEFAULT_REG_PC_OFFSET),
+        Some(s) => {
+            let parsed = s.split_once(',').and_then(|(a, b)| {
+                Some((parse_num(a)?, parse_num(b)?))
+            });
+            parsed.expect("--profile-6809-offsets expects CPU_PTR_OFFSET,REG_PC_OFFSET")
+        }
+    };
+
+    let locator = symbols.as_ref().and_then(|s| s.machine_addr()).map(|machine_addr| {
+        println!(
+            "Profiler: 6809 PC at g_m=0x{:08X} -> cpu@+{} -> reg_pc@+{}",
+            machine_addr, cpu_ptr_offset, reg_pc_offset
+        );
+        M6809Locator { machine_addr, cpu_ptr_offset, reg_pc_offset }
+    });
+    if locator.is_none() {
+        eprintln!("Profiler: 6809 guest not sampled (needs --elf or roms/cocozero.elf with a g_m symbol)");
+    }
+
+    Profiler::new(args.profile_interval, symbols, locator)
+}
+
+fn parse_num(s: &str) -> Option<u32> {
+    let s = s.trim();
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => s.parse().ok(),
+    }
 }

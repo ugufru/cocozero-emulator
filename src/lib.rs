@@ -7,6 +7,7 @@ pub mod interconnect;
 pub mod soc;
 pub mod keyboard;
 pub mod symbols;
+pub mod profiler;
 
 
 
